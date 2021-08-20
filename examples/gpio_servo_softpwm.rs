@@ -58,7 +58,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Enable software-based PWM with the specified period, and rotate the servo by
     // setting the pulse width to its maximum value.
-    pin.set_pwm(
+    pin.set_pwm_repeating(
         Duration::from_millis(PERIOD_MS),
         Duration::from_micros(PULSE_MAX_US),
     )?;
@@ -67,7 +67,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     thread::sleep(Duration::from_millis(500));
 
     // Rotate the servo to the opposite side.
-    pin.set_pwm(
+    pin.set_pwm_repeating(
         Duration::from_millis(PERIOD_MS),
         Duration::from_micros(PULSE_MIN_US),
     )?;
@@ -76,7 +76,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Rotate the servo to its neutral (center) position in small steps.
     for pulse in (PULSE_MIN_US..=PULSE_NEUTRAL_US).step_by(10) {
-        pin.set_pwm(
+        pin.set_pwm_repeating(
             Duration::from_millis(PERIOD_MS),
             Duration::from_micros(pulse),
         )?;

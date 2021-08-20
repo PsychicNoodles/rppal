@@ -19,12 +19,13 @@
 // DEALINGS IN THE SOFTWARE.
 
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use super::soft_pwm::SoftPwm;
-use crate::gpio::{interrupt::AsyncInterrupt, GpioState, Level, Mode, PullUpDown, Result, Trigger};
+use crate::gpio::{GpioState, interrupt::AsyncInterrupt, Level, Mode, PullUpDown, Result, Trigger};
+
+use super::soft_pwm::{PwmDurations, SoftPwm};
 
 const NANOS_PER_SEC: f64 = 1_000_000_000.0;
 
@@ -107,6 +108,14 @@ macro_rules! impl_output {
             }
         }
 
+        pub fn set_pwm_repeating(&mut self, period: Duration, pulse_width: Duration) -> Result<()> {
+            self.set_pwm(vec![( period, pulse_width )], true)
+        }
+
+        pub fn set_pwm_once(&mut self, period: Duration, pulse_width: Duration) -> Result<()> {
+            self.set_pwm(vec![( period, pulse_width )], false)
+        }
+
         /// Configures a software-based PWM signal.
         ///
         /// `period` indicates the time it takes to complete one cycle.
@@ -123,15 +132,17 @@ macro_rules! impl_output {
         ///
         /// [`Pwm`]: ../pwm/struct.Pwm.html
         /// [here]: index.html#software-based-pwm
-        pub fn set_pwm(&mut self, period: Duration, pulse_width: Duration) -> Result<()> {
+        pub fn set_pwm(&mut self, period_pulse_widths: Vec<(Duration, Duration)>, repeat_indefinitely: bool) -> Result<()> {
+            let repeat_opt = repeat_indefinitely.then(|| period_pulse_widths.last().cloned().map(PwmDurations::from)).flatten();
+            let pwm_durations = period_pulse_widths.into_iter().map(PwmDurations::from);
             if let Some(ref mut soft_pwm) = self.soft_pwm {
-                soft_pwm.reconfigure(period, pulse_width);
+                soft_pwm.reconfigure(pwm_durations, repeat_opt);
             } else {
                 self.soft_pwm = Some(SoftPwm::new(
                     self.pin.pin,
                     self.pin.gpio_state.clone(),
-                    period,
-                    pulse_width,
+                    pwm_durations,
+                    repeat_opt,
                 ));
             }
 
@@ -155,6 +166,14 @@ macro_rules! impl_output {
             Ok(())
         }
 
+        pub fn set_pwm_frequency_repeating(&mut self, frequency: f64, duty_cycle: f64) -> Result<()> {
+            self.set_pwm_frequency(vec![(frequency, duty_cycle)], true)
+        }
+
+        pub fn set_pwm_frequency_once(&mut self, frequency: f64, duty_cycle: f64) -> Result<()> {
+            self.set_pwm_frequency(vec![(frequency, duty_cycle)], false)
+        }
+
         /// Configures a software-based PWM signal.
         ///
         /// `set_pwm_frequency` is a convenience method that converts `frequency` to a period and
@@ -165,18 +184,23 @@ macro_rules! impl_output {
         /// `duty_cycle` is specified as a floating point value between `0.0` (0%) and `1.0` (100%).
         ///
         /// [`set_pwm`]: #method.set_pwm
-        pub fn set_pwm_frequency(&mut self, frequency: f64, duty_cycle: f64) -> Result<()> {
+        pub fn set_pwm_frequency(&mut self, frequency_duty_cycles: Vec<(f64, f64)>, repeat_indefinitely: bool) -> Result<()> {
+            let period_pulse_widths = frequency_duty_cycles.into_iter().map(Self::from_frequency).collect();
+            self.set_pwm(
+                period_pulse_widths,
+                repeat_indefinitely
+            )
+        }
+
+        fn from_frequency(frequency_duty_cycle: (f64, f64)) -> (Duration, Duration) {
+            let (frequency, duty_cycle) = frequency_duty_cycle;
             let period = if frequency <= 0.0 {
                 0.0
             } else {
                 (1.0 / frequency) * NANOS_PER_SEC
             };
             let pulse_width = period * duty_cycle.max(0.0).min(1.0);
-
-            self.set_pwm(
-                Duration::from_nanos(period as u64),
-                Duration::from_nanos(pulse_width as u64),
-            )
+            (Duration::from_nanos(period as u64), Duration::from_nanos(pulse_width as u64),)
         }
 
         /// Stops a previously configured software-based PWM signal.
@@ -543,8 +567,8 @@ impl InputPin {
     /// [`clear_async_interrupt`]: #method.clear_async_interrupt
     /// [`Level`]: enum.Level.html
     pub fn set_async_interrupt<C>(&mut self, trigger: Trigger, callback: C) -> Result<()>
-    where
-        C: FnMut(Level) + Send + 'static,
+        where
+            C: FnMut(Level) + Send + 'static,
     {
         self.clear_interrupt()?;
         self.clear_async_interrupt()?;

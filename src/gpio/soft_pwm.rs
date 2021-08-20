@@ -23,13 +23,14 @@
 #![allow(dead_code)]
 
 use std::ptr;
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use libc::{
-    self, c_long, sched_param, time_t, timespec, CLOCK_MONOTONIC, PR_SET_TIMERSLACK, SCHED_RR,
+    self, c_long, CLOCK_MONOTONIC, PR_SET_TIMERSLACK, sched_param, SCHED_RR, time_t, timespec,
 };
 
 use super::{Error, GpioState, Result};
@@ -43,10 +44,44 @@ const BUSYWAIT_REMAINDER: i64 = 100;
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
 
-#[derive(Debug, PartialEq, Eq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub(crate) struct PwmDurations {
+    period: Duration,
+    pulse_width: Duration,
+}
+
+impl From<(Duration, Duration)> for PwmDurations {
+    fn from((period, pulse_width): (Duration, Duration)) -> Self {
+        PwmDurations { period, pulse_width }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone)]
 enum Msg {
-    Reconfigure(Duration, Duration),
+    Reconfigure(Vec<PwmDurations>, Option<PwmDurations>),
     Stop,
+}
+
+fn prepare_iter<T>(period_pulse_widths: T, repeat_indefinitely: Option<PwmDurations>) -> Box<dyn Iterator<Item=(i64, i64)>> where T: IntoIterator<Item=PwmDurations>, <T as IntoIterator>::IntoIter: 'static {
+    let base_iter = period_pulse_widths.into_iter().map(|PwmDurations { period, pulse_width }| (period.as_nanos() as i64, pulse_width.as_nanos() as i64));
+    match repeat_indefinitely {
+        Some(PwmDurations { period, pulse_width }) =>
+            Box::new(base_iter.chain(std::iter::repeat((period.as_nanos() as i64, pulse_width.as_nanos() as i64)))),
+        _ => Box::new(base_iter)
+    }
+}
+
+fn process_msg(msg: Msg) -> Option<Box<dyn Iterator<Item=(i64, i64)>>> {
+    match msg {
+        Msg::Reconfigure(period_pulse_widths, repeat_indefinitely) => {
+            // Reconfigure period and pulse width
+            Some(prepare_iter(period_pulse_widths, repeat_indefinitely))
+        }
+        Msg::Stop => {
+            // The main thread asked us to stop
+            None
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -56,24 +91,28 @@ pub(crate) struct SoftPwm {
 }
 
 impl SoftPwm {
-    pub(crate) fn new(
-        pin: u8,
-        gpio_state: Arc<GpioState>,
-        period: Duration,
-        pulse_width: Duration,
-    ) -> SoftPwm {
+    pub(crate) fn new<T: IntoIterator<Item=PwmDurations> + Send + Sync + 'static>(pin: u8, gpio_state: Arc<GpioState>, sequence: T, repeat_indefinitely: Option<PwmDurations>) -> SoftPwm {
+        let (sender, pwm_thread) = SoftPwm::start(pin, gpio_state, sequence, repeat_indefinitely);
+
+        SoftPwm {
+            pwm_thread: Some(pwm_thread),
+            sender,
+        }
+    }
+
+    fn start<T: IntoIterator<Item=PwmDurations> + Send + Sync + 'static>(pin: u8, gpio_state: Arc<GpioState>, period_pulse_widths: T, repeat_indefinitely: Option<PwmDurations>) -> (Sender<Msg>, JoinHandle<Result<()>>) {
         let (sender, receiver): (Sender<Msg>, Receiver<Msg>) = mpsc::channel();
 
         let pwm_thread = thread::spawn(move || -> Result<()> {
             // Set the scheduling policy to real-time round robin at the highest priority. This
             // will silently fail if we're not running as root.
             #[cfg(target_env = "gnu")]
-            let params = sched_param {
+                let params = sched_param {
                 sched_priority: unsafe { libc::sched_get_priority_max(SCHED_RR) },
             };
 
             #[cfg(target_env = "musl")]
-            let params = sched_param {
+                let params = sched_param {
                 sched_priority: unsafe { libc::sched_get_priority_max(SCHED_RR) },
                 sched_ss_low_priority: 0,
                 sched_ss_repl_period: timespec {
@@ -97,80 +136,83 @@ impl SoftPwm {
                 libc::prctl(PR_SET_TIMERSLACK, 1);
             }
 
-            let mut period_ns = period.as_nanos() as i64;
-            let mut pulse_width_ns = pulse_width.as_nanos() as i64;
+            let mut ppw_iter = prepare_iter(period_pulse_widths, repeat_indefinitely);
 
             let mut start_ns = get_time_ns();
 
             loop {
-                // PWM active
-                if pulse_width_ns > 0 {
-                    gpio_state.gpio_mem.set_high(pin);
-                }
+                match ppw_iter.next() {
+                    Some((period_ns, pulse_width_ns)) => {
+                        // PWM active
+                        if pulse_width_ns > 0 {
+                            gpio_state.gpio_mem.set_high(pin);
+                        }
 
-                // Sleep if we have enough time remaining, while reserving some time
-                // for busy waiting to compensate for sleep taking longer than needed.
-                if pulse_width_ns >= SLEEP_THRESHOLD {
-                    sleep_ns(pulse_width_ns - BUSYWAIT_MAX);
-                }
+                        // Sleep if we have enough time remaining, while reserving some time
+                        // for busy waiting to compensate for sleep taking longer than needed.
+                        if pulse_width_ns >= SLEEP_THRESHOLD {
+                            sleep_ns(pulse_width_ns - BUSYWAIT_MAX);
+                        }
 
-                // Busy-wait for the remaining active time, minus BUSYWAIT_REMAINDER
-                // to account for get_time_ns() overhead
-                loop {
-                    if (pulse_width_ns - (get_time_ns() - start_ns)) <= BUSYWAIT_REMAINDER {
-                        break;
-                    }
-                }
-
-                // PWM inactive
-                gpio_state.gpio_mem.set_low(pin);
-
-                while let Ok(msg) = receiver.try_recv() {
-                    match msg {
-                        Msg::Reconfigure(period, pulse_width) => {
-                            // Reconfigure period and pulse width
-                            pulse_width_ns = pulse_width.as_nanos() as i64;
-                            period_ns = period.as_nanos() as i64;
-
-                            if pulse_width_ns > period_ns {
-                                pulse_width_ns = period_ns;
+                        // Busy-wait for the remaining active time, minus BUSYWAIT_REMAINDER
+                        // to account for get_time_ns() overhead
+                        loop {
+                            if (pulse_width_ns - (get_time_ns() - start_ns)) <= BUSYWAIT_REMAINDER {
+                                break;
                             }
                         }
-                        Msg::Stop => {
-                            // The main thread asked us to stop
-                            return Ok(());
+
+                        // PWM inactive
+                        gpio_state.gpio_mem.set_low(pin);
+
+                        // Get next PWM duration and prepare next period duration
+                        while let Ok(msg) = receiver.try_recv() {
+                            match process_msg(msg) {
+                                Some(_ppw_iter) => ppw_iter = _ppw_iter,
+                                None => return Ok(())
+                            }
+                        }
+
+                        let remaining_ns = period_ns - (get_time_ns() - start_ns);
+
+                        // Sleep if we have enough time remaining, while reserving some time
+                        // for busy waiting to compensate for sleep taking longer than needed.
+                        if remaining_ns >= SLEEP_THRESHOLD {
+                            sleep_ns(remaining_ns - BUSYWAIT_MAX);
+                        }
+
+                        // Busy-wait for the remaining inactive time, minus BUSYWAIT_REMAINDER
+                        // to account for get_time_ns() overhead
+                        loop {
+                            let current_ns = get_time_ns();
+                            if (period_ns - (current_ns - start_ns)) <= BUSYWAIT_REMAINDER {
+                                start_ns = current_ns;
+                                break;
+                            }
                         }
                     }
-                }
-
-                let remaining_ns = period_ns - (get_time_ns() - start_ns);
-
-                // Sleep if we have enough time remaining, while reserving some time
-                // for busy waiting to compensate for sleep taking longer than needed.
-                if remaining_ns >= SLEEP_THRESHOLD {
-                    sleep_ns(remaining_ns - BUSYWAIT_MAX);
-                }
-
-                // Busy-wait for the remaining inactive time, minus BUSYWAIT_REMAINDER
-                // to account for get_time_ns() overhead
-                loop {
-                    let current_ns = get_time_ns();
-                    if (period_ns - (current_ns - start_ns)) <= BUSYWAIT_REMAINDER {
-                        start_ns = current_ns;
-                        break;
+                    None => {
+                        match receiver.recv().map(process_msg) {
+                            Ok(Some(_ppw_iter)) => ppw_iter = _ppw_iter,
+                            // Received a Stop msg or recv returned an error
+                            Ok(None) | Err(_) => return Ok(()),
+                        }
+                        // Get through any other messages that may have been queued up
+                        while let Ok(msg) = receiver.try_recv() {
+                            match process_msg(msg) {
+                                Some(_ppw_iter) => ppw_iter = _ppw_iter,
+                                None => return Ok(())
+                            }
+                        }
                     }
                 }
             }
         });
-
-        SoftPwm {
-            pwm_thread: Some(pwm_thread),
-            sender,
-        }
+        (sender, pwm_thread)
     }
 
-    pub(crate) fn reconfigure(&mut self, period: Duration, pulse_width: Duration) {
-        let _ = self.sender.send(Msg::Reconfigure(period, pulse_width));
+    pub(crate) fn reconfigure<T: IntoIterator<Item=PwmDurations>>(&mut self, period_pulse_widths: T, repeat_indefinitely: Option<PwmDurations>) {
+        let _ = self.sender.send(Msg::Reconfigure(period_pulse_widths.into_iter().collect(), repeat_indefinitely));
     }
 
     pub(crate) fn stop(&mut self) -> Result<()> {
