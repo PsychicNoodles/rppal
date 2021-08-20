@@ -126,11 +126,11 @@ enum Msg {
 }
 
 fn prepare_iter<T>(period_pulse_widths: T, repeat_indefinitely: bool) -> Box<dyn Iterator<Item=(i64, i64)>> where T: IntoIterator<Item=PwmWave>, <T as IntoIterator>::IntoIter: Clone + 'static {
-    let base_iter = period_pulse_widths.into_iter().map(|wave| match wave {
-        PwmWave::Pulse(PwmPulse { period, pulse_width }) => (period.as_nanos() as i64, pulse_width.as_nanos() as i64),
-        PwmWave::Frequency(freq) => From::from(PwmPulse::from(freq)),
-        PwmWave::Wait(period) => (period.as_nanos() as i64, 0)
-    });
+    let base_iter = period_pulse_widths.into_iter().map(|wave| From::from(match wave {
+        PwmWave::Pulse(pulse) => pulse,
+        PwmWave::Frequency(freq) => PwmPulse::from(freq),
+        PwmWave::Wait(period) => PwmPulse { period, pulse_width: Duration::ZERO }
+    }));
     if repeat_indefinitely {
         Box::new(base_iter.cycle())
     } else {
@@ -204,11 +204,12 @@ impl SoftPwm {
             }
 
             let mut ppw_iter = prepare_iter(period_pulse_widths, repeat_indefinitely);
+            let mut ppw_next = ppw_iter.next();
 
             let mut start_ns = get_time_ns();
 
             loop {
-                match ppw_iter.next() {
+                match ppw_next {
                     Some((period_ns, pulse_width_ns)) => {
                         // PWM active
                         if pulse_width_ns > 0 {
@@ -239,6 +240,9 @@ impl SoftPwm {
                                 None => return Ok(())
                             }
                         }
+
+                        // Buffer next pair
+                        ppw_next = ppw_iter.next();
 
                         let remaining_ns = period_ns - (get_time_ns() - start_ns);
 
