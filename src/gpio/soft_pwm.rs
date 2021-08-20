@@ -43,31 +43,98 @@ const BUSYWAIT_MAX: i64 = 200_000;
 const BUSYWAIT_REMAINDER: i64 = 100;
 
 const NANOS_PER_SEC: i64 = 1_000_000_000;
+const NANOS_PER_SEC_F: f64 = 1_000_000_000.0;
 
+/// `period` indicates the time it takes to complete one cycle.
+///
+/// `pulse_width` indicates the amount of time the PWM signal is active during a
+/// single period.
 #[derive(Debug, PartialEq, Eq, Clone)]
-pub(crate) struct PwmDurations {
-    period: Duration,
-    pulse_width: Duration,
+pub struct PwmPulse {
+    pub period: Duration,
+    pub pulse_width: Duration,
 }
 
-impl From<(Duration, Duration)> for PwmDurations {
+impl From<(Duration, Duration)> for PwmPulse {
     fn from((period, pulse_width): (Duration, Duration)) -> Self {
-        PwmDurations { period, pulse_width }
+        PwmPulse { period, pulse_width }
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Clone)]
+impl From<PwmPulse> for (i64, i64) {
+    fn from(PwmPulse { period, pulse_width }: PwmPulse) -> Self {
+        (period.as_nanos() as i64, pulse_width.as_nanos() as i64)
+    }
+}
+
+/// `frequency` is specified in hertz (Hz).
+///
+/// `duty_cycle` is specified as a floating point value between `0.0` (0%) and `1.0` (100%).
+#[derive(Debug, PartialEq, Clone)]
+pub struct PwmFrequency {
+    pub frequency: f64,
+    pub duty_cycle: f64,
+}
+
+impl From<(f64, f64)> for PwmFrequency {
+    fn from((frequency, duty_cycle): (f64, f64)) -> Self {
+        PwmFrequency { frequency, duty_cycle }
+    }
+}
+
+impl From<PwmFrequency> for PwmPulse {
+    fn from(PwmFrequency { frequency, duty_cycle }: PwmFrequency) -> Self {
+        let period = if frequency <= 0.0 {
+            0.0
+        } else {
+            (1.0 / frequency) * NANOS_PER_SEC_F
+        };
+        let pulse_width = period * duty_cycle.max(0.0).min(1.0);
+        PwmPulse {
+            period: Duration::from_nanos(period as u64),
+            pulse_width: Duration::from_nanos(pulse_width as u64),
+        }
+    }
+}
+
+/// `Pulse` ([`PwmPulse`]):
+///
+/// `period` indicates the time it takes to complete one cycle.
+///
+/// `pulse_width` indicates the amount of time the PWM signal is active during a
+/// single period.
+///
+/// `Frequency` ([`PwmFrequency`]):
+///
+/// `frequency` is specified in hertz (Hz).
+///
+/// `duty_cycle` is specified as a floating point value between `0.0` (0%) and `1.0` (100%).
+///
+/// [`PwmPulse`]: ./struct.PwmPulse.html
+/// [`PwmFrequency`]: ./struct.PwmFrequency.html
+#[derive(Debug, PartialEq, Clone)]
+pub enum PwmWave {
+    Pulse(PwmPulse),
+    Frequency(PwmFrequency),
+    Wait(Duration),
+}
+
+#[derive(Debug, PartialEq, Clone)]
 enum Msg {
-    Reconfigure(Vec<PwmDurations>, Option<PwmDurations>),
+    Reconfigure(Vec<PwmWave>, bool),
     Stop,
 }
 
-fn prepare_iter<T>(period_pulse_widths: T, repeat_indefinitely: Option<PwmDurations>) -> Box<dyn Iterator<Item=(i64, i64)>> where T: IntoIterator<Item=PwmDurations>, <T as IntoIterator>::IntoIter: 'static {
-    let base_iter = period_pulse_widths.into_iter().map(|PwmDurations { period, pulse_width }| (period.as_nanos() as i64, pulse_width.as_nanos() as i64));
-    match repeat_indefinitely {
-        Some(PwmDurations { period, pulse_width }) =>
-            Box::new(base_iter.chain(std::iter::repeat((period.as_nanos() as i64, pulse_width.as_nanos() as i64)))),
-        _ => Box::new(base_iter)
+fn prepare_iter<T>(period_pulse_widths: T, repeat_indefinitely: bool) -> Box<dyn Iterator<Item=(i64, i64)>> where T: IntoIterator<Item=PwmWave>, <T as IntoIterator>::IntoIter: Clone + 'static {
+    let base_iter = period_pulse_widths.into_iter().map(|wave| match wave {
+        PwmWave::Pulse(PwmPulse { period, pulse_width }) => (period.as_nanos() as i64, pulse_width.as_nanos() as i64),
+        PwmWave::Frequency(freq) => From::from(PwmPulse::from(freq)),
+        PwmWave::Wait(period) => (period.as_nanos() as i64, 0)
+    });
+    if repeat_indefinitely {
+        Box::new(base_iter.cycle())
+    } else {
+        Box::new(base_iter)
     }
 }
 
@@ -91,7 +158,7 @@ pub(crate) struct SoftPwm {
 }
 
 impl SoftPwm {
-    pub(crate) fn new<T: IntoIterator<Item=PwmDurations> + Send + Sync + 'static>(pin: u8, gpio_state: Arc<GpioState>, sequence: T, repeat_indefinitely: Option<PwmDurations>) -> SoftPwm {
+    pub(crate) fn new<T>(pin: u8, gpio_state: Arc<GpioState>, sequence: T, repeat_indefinitely: bool) -> SoftPwm where T: IntoIterator<Item=PwmWave> + Send + Sync + 'static, <T as IntoIterator>::IntoIter: Clone {
         let (sender, pwm_thread) = SoftPwm::start(pin, gpio_state, sequence, repeat_indefinitely);
 
         SoftPwm {
@@ -100,7 +167,7 @@ impl SoftPwm {
         }
     }
 
-    fn start<T: IntoIterator<Item=PwmDurations> + Send + Sync + 'static>(pin: u8, gpio_state: Arc<GpioState>, period_pulse_widths: T, repeat_indefinitely: Option<PwmDurations>) -> (Sender<Msg>, JoinHandle<Result<()>>) {
+    fn start<T>(pin: u8, gpio_state: Arc<GpioState>, period_pulse_widths: T, repeat_indefinitely: bool) -> (Sender<Msg>, JoinHandle<Result<()>>) where T: IntoIterator<Item=PwmWave> + Send + Sync + 'static, <T as IntoIterator>::IntoIter: Clone {
         let (sender, receiver): (Sender<Msg>, Receiver<Msg>) = mpsc::channel();
 
         let pwm_thread = thread::spawn(move || -> Result<()> {
@@ -211,7 +278,7 @@ impl SoftPwm {
         (sender, pwm_thread)
     }
 
-    pub(crate) fn reconfigure<T: IntoIterator<Item=PwmDurations>>(&mut self, period_pulse_widths: T, repeat_indefinitely: Option<PwmDurations>) {
+    pub(crate) fn reconfigure<T: IntoIterator<Item=PwmWave>>(&mut self, period_pulse_widths: T, repeat_indefinitely: bool) {
         let _ = self.sender.send(Msg::Reconfigure(period_pulse_widths.into_iter().collect(), repeat_indefinitely));
     }
 

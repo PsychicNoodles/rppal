@@ -25,9 +25,8 @@ use std::time::Duration;
 
 use crate::gpio::{GpioState, interrupt::AsyncInterrupt, Level, Mode, PullUpDown, Result, Trigger};
 
-use super::soft_pwm::{PwmDurations, SoftPwm};
+use super::soft_pwm::{PwmPulse, PwmWave, SoftPwm};
 
-const NANOS_PER_SEC: f64 = 1_000_000_000.0;
 
 // Maximum GPIO pins on the BCM2835. The actual number of pins
 // exposed through the Pi's GPIO header depends on the model.
@@ -109,19 +108,16 @@ macro_rules! impl_output {
         }
 
         pub fn set_pwm_repeating(&mut self, period: Duration, pulse_width: Duration) -> Result<()> {
-            self.set_pwm(vec![( period, pulse_width )], true)
+            self.set_pwm(vec![PwmWave::Pulse(PwmPulse { period, pulse_width })], true)
         }
 
         pub fn set_pwm_once(&mut self, period: Duration, pulse_width: Duration) -> Result<()> {
-            self.set_pwm(vec![( period, pulse_width )], false)
+            self.set_pwm(vec![PwmWave::Pulse(PwmPulse { period, pulse_width })], false)
         }
 
         /// Configures a software-based PWM signal.
         ///
-        /// `period` indicates the time it takes to complete one cycle.
-        ///
-        /// `pulse_width` indicates the amount of time the PWM signal is active during a
-        /// single period.
+        /// See [`PwmWave`] for details on `wave_sequence`.
         ///
         /// Software-based PWM is inherently inaccurate on a multi-threaded OS due to
         /// scheduling/preemption. If an accurate or faster PWM signal is required, use the
@@ -130,19 +126,18 @@ macro_rules! impl_output {
         /// If `set_pwm` is called when a PWM thread is already active, the existing thread
         /// will be reconfigured at the end of the current cycle.
         ///
+        /// [`PwmWave`]: ./enum.PwmWave.html
         /// [`Pwm`]: ../pwm/struct.Pwm.html
         /// [here]: index.html#software-based-pwm
-        pub fn set_pwm(&mut self, period_pulse_widths: Vec<(Duration, Duration)>, repeat_indefinitely: bool) -> Result<()> {
-            let repeat_opt = repeat_indefinitely.then(|| period_pulse_widths.last().cloned().map(PwmDurations::from)).flatten();
-            let pwm_durations = period_pulse_widths.into_iter().map(PwmDurations::from);
+        pub fn set_pwm(&mut self, wave_sequence: Vec<PwmWave>, repeat_indefinitely: bool) -> Result<()> {
             if let Some(ref mut soft_pwm) = self.soft_pwm {
-                soft_pwm.reconfigure(pwm_durations, repeat_opt);
+                soft_pwm.reconfigure(wave_sequence, repeat_indefinitely);
             } else {
                 self.soft_pwm = Some(SoftPwm::new(
                     self.pin.pin,
                     self.pin.gpio_state.clone(),
-                    pwm_durations,
-                    repeat_opt,
+                    wave_sequence,
+                    repeat_indefinitely,
                 ));
             }
 
@@ -164,43 +159,6 @@ macro_rules! impl_output {
             }
 
             Ok(())
-        }
-
-        pub fn set_pwm_frequency_repeating(&mut self, frequency: f64, duty_cycle: f64) -> Result<()> {
-            self.set_pwm_frequency(vec![(frequency, duty_cycle)], true)
-        }
-
-        pub fn set_pwm_frequency_once(&mut self, frequency: f64, duty_cycle: f64) -> Result<()> {
-            self.set_pwm_frequency(vec![(frequency, duty_cycle)], false)
-        }
-
-        /// Configures a software-based PWM signal.
-        ///
-        /// `set_pwm_frequency` is a convenience method that converts `frequency` to a period and
-        /// `duty_cycle` to a pulse width, and then calls [`set_pwm`].
-        ///
-        /// `frequency` is specified in hertz (Hz).
-        ///
-        /// `duty_cycle` is specified as a floating point value between `0.0` (0%) and `1.0` (100%).
-        ///
-        /// [`set_pwm`]: #method.set_pwm
-        pub fn set_pwm_frequency(&mut self, frequency_duty_cycles: Vec<(f64, f64)>, repeat_indefinitely: bool) -> Result<()> {
-            let period_pulse_widths = frequency_duty_cycles.into_iter().map(Self::from_frequency).collect();
-            self.set_pwm(
-                period_pulse_widths,
-                repeat_indefinitely
-            )
-        }
-
-        fn from_frequency(frequency_duty_cycle: (f64, f64)) -> (Duration, Duration) {
-            let (frequency, duty_cycle) = frequency_duty_cycle;
-            let period = if frequency <= 0.0 {
-                0.0
-            } else {
-                (1.0 / frequency) * NANOS_PER_SEC
-            };
-            let pulse_width = period * duty_cycle.max(0.0).min(1.0);
-            (Duration::from_nanos(period as u64), Duration::from_nanos(pulse_width as u64),)
         }
 
         /// Stops a previously configured software-based PWM signal.
