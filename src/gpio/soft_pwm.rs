@@ -24,6 +24,7 @@
 
 use std::ptr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::thread::JoinHandle;
@@ -155,19 +156,22 @@ fn process_msg(msg: Msg) -> Option<Box<dyn Iterator<Item=(i64, i64)>>> {
 pub(crate) struct SoftPwm {
     pwm_thread: Option<thread::JoinHandle<Result<()>>>,
     sender: Sender<Msg>,
+    running: Arc<AtomicBool>,
 }
 
 impl SoftPwm {
     pub(crate) fn new<T>(pin: u8, gpio_state: Arc<GpioState>, sequence: T, repeat_indefinitely: bool) -> SoftPwm where T: IntoIterator<Item=PwmWave> + Send + Sync + 'static, <T as IntoIterator>::IntoIter: Clone {
-        let (sender, pwm_thread) = SoftPwm::start(pin, gpio_state, sequence, repeat_indefinitely);
+        let running = Arc::new(AtomicBool::new(false));
+        let (sender, pwm_thread) = SoftPwm::start(pin, gpio_state, sequence, repeat_indefinitely, running.clone());
 
         SoftPwm {
             pwm_thread: Some(pwm_thread),
             sender,
+            running,
         }
     }
 
-    fn start<T>(pin: u8, gpio_state: Arc<GpioState>, period_pulse_widths: T, repeat_indefinitely: bool) -> (Sender<Msg>, JoinHandle<Result<()>>) where T: IntoIterator<Item=PwmWave> + Send + Sync + 'static, <T as IntoIterator>::IntoIter: Clone {
+    fn start<T>(pin: u8, gpio_state: Arc<GpioState>, period_pulse_widths: T, repeat_indefinitely: bool, running: Arc<AtomicBool>) -> (Sender<Msg>, JoinHandle<Result<()>>) where T: IntoIterator<Item=PwmWave> + Send + Sync + 'static, <T as IntoIterator>::IntoIter: Clone {
         let (sender, receiver): (Sender<Msg>, Receiver<Msg>) = mpsc::channel();
 
         let pwm_thread = thread::spawn(move || -> Result<()> {
@@ -205,6 +209,9 @@ impl SoftPwm {
 
             let mut ppw_iter = prepare_iter(period_pulse_widths, repeat_indefinitely);
             let mut ppw_next = ppw_iter.next();
+            if ppw_next.is_some() {
+                running.store(true, Ordering::Release);
+            }
 
             let mut start_ns = get_time_ns();
 
@@ -263,6 +270,7 @@ impl SoftPwm {
                         }
                     }
                     None => {
+                        running.store(false, Ordering::Release);
                         match receiver.recv().map(process_msg) {
                             Ok(Some(_ppw_iter)) => ppw_iter = _ppw_iter,
                             // Received a Stop msg or recv returned an error
@@ -275,6 +283,7 @@ impl SoftPwm {
                                 None => return Ok(())
                             }
                         }
+                        running.store(true, Ordering::Release);
                     }
                 }
             }
@@ -296,6 +305,10 @@ impl SoftPwm {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.running.load(Ordering::Acquire)
     }
 }
 

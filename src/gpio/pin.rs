@@ -172,6 +172,11 @@ macro_rules! impl_output {
 
             Ok(())
         }
+
+        /// Checks if software-based PWM is still running/has remaining pulses.
+        pub fn is_pwm_running(&self) -> bool {
+            self.soft_pwm.as_ref().map(|pwm| pwm.is_running()).unwrap_or(false)
+        }
     };
 }
 
