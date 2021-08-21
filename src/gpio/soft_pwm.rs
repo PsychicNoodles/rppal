@@ -23,15 +23,15 @@
 #![allow(dead_code)]
 
 use std::ptr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use libc::{
-    self, c_long, sched_param, time_t, timespec, CLOCK_MONOTONIC, PR_SET_TIMERSLACK, SCHED_RR,
+    self, c_long, CLOCK_MONOTONIC, PR_SET_TIMERSLACK, sched_param, SCHED_RR, time_t, timespec,
 };
 
 use super::{Error, GpioState, Result};
@@ -161,10 +161,10 @@ enum Msg {
     Stop,
 }
 
-fn to_nanos_iter<T>(pwm_steps: T, repeat_indefinitely: bool) -> Box<dyn Iterator<Item = (i64, i64)>>
-where
-    T: IntoIterator<Item = PwmStep>,
-    <T as IntoIterator>::IntoIter: Clone + 'static,
+fn to_nanos_iter<T>(pwm_steps: T, repeat_indefinitely: bool) -> Box<dyn Iterator<Item=(i64, i64)>>
+    where
+        T: IntoIterator<Item=PwmStep>,
+        <T as IntoIterator>::IntoIter: Clone + 'static,
 {
     let base_iter = pwm_steps.into_iter().map(PwmPulse::from).map(From::from);
     if repeat_indefinitely {
@@ -174,7 +174,7 @@ where
     }
 }
 
-fn process_msg(msg: Msg) -> Option<Box<dyn Iterator<Item = (i64, i64)>>> {
+fn process_msg(msg: Msg) -> Option<Box<dyn Iterator<Item=(i64, i64)>>> {
     match msg {
         Msg::Reconfigure(pwm_steps, repeat_indefinitely) => {
             // Reconfigure period and pulse width
@@ -201,9 +201,9 @@ impl SoftPwm {
         pwm_steps: T,
         repeat_indefinitely: bool,
     ) -> SoftPwm
-    where
-        T: IntoIterator<Item = PwmStep> + Send + Sync + 'static,
-        <T as IntoIterator>::IntoIter: Clone,
+        where
+            T: IntoIterator<Item=PwmStep> + Send + Sync + 'static,
+            <T as IntoIterator>::IntoIter: Clone,
     {
         let running = Arc::new(AtomicBool::new(false));
         let (sender, pwm_thread) = SoftPwm::start(
@@ -228,9 +228,9 @@ impl SoftPwm {
         repeat_indefinitely: bool,
         running: Arc<AtomicBool>,
     ) -> (Sender<Msg>, JoinHandle<Result<()>>)
-    where
-        T: IntoIterator<Item = PwmStep> + Send + Sync + 'static,
-        <T as IntoIterator>::IntoIter: Clone,
+        where
+            T: IntoIterator<Item=PwmStep> + Send + Sync + 'static,
+            <T as IntoIterator>::IntoIter: Clone,
     {
         let (sender, receiver): (Sender<Msg>, Receiver<Msg>) = mpsc::channel();
 
@@ -238,12 +238,12 @@ impl SoftPwm {
             // Set the scheduling policy to real-time round robin at the highest priority. This
             // will silently fail if we're not running as root.
             #[cfg(target_env = "gnu")]
-            let params = sched_param {
+                let params = sched_param {
                 sched_priority: unsafe { libc::sched_get_priority_max(SCHED_RR) },
             };
 
             #[cfg(target_env = "musl")]
-            let params = sched_param {
+                let params = sched_param {
                 sched_priority: unsafe { libc::sched_get_priority_max(SCHED_RR) },
                 sched_ss_low_priority: 0,
                 sched_ss_repl_period: timespec {
@@ -343,7 +343,10 @@ impl SoftPwm {
                         // Wait for a sequence
                         match receiver.recv().map(process_msg) {
                             // Received a Reconfigure
-                            Ok(Some(_ppw_iter)) => pwm_nano_iter = _ppw_iter,
+                            Ok(Some(_ppw_iter)) => {
+                                pwm_nano_iter = _ppw_iter;
+                                pwm_next_nano = pwm_nano_iter.next();
+                            }
                             // Received a Stop msg or receiver was closed
                             Ok(None) | Err(_) => return Ok(()),
                         }
@@ -372,7 +375,7 @@ impl SoftPwm {
         (sender, pwm_thread)
     }
 
-    pub(crate) fn reconfigure<T: IntoIterator<Item = PwmStep>>(
+    pub(crate) fn reconfigure<T: IntoIterator<Item=PwmStep>>(
         &mut self,
         pwm_steps: T,
         repeat_indefinitely: bool,
