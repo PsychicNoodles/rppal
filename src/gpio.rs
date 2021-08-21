@@ -158,7 +158,7 @@ mod soft_pwm;
 use crate::system;
 
 pub use self::pin::{InputPin, IoPin, OutputPin, Pin};
-pub use self::soft_pwm::{PwmStep, PwmPulse, PwmFrequency};
+pub use self::soft_pwm::{PwmFrequency, PwmPulse, PwmStep};
 
 /// Errors that can occur when accessing the GPIO peripheral.
 #[derive(Debug)]

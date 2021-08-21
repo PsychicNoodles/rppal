@@ -19,14 +19,13 @@
 // DEALINGS IN THE SOFTWARE.
 
 use std::os::unix::io::AsRawFd;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::gpio::{GpioState, interrupt::AsyncInterrupt, Level, Mode, PullUpDown, Result, Trigger};
+use crate::gpio::{interrupt::AsyncInterrupt, GpioState, Level, Mode, PullUpDown, Result, Trigger};
 
-use super::soft_pwm::{PwmPulse, PwmStep, PwmFrequency, SoftPwm};
-
+use super::soft_pwm::{PwmFrequency, PwmPulse, PwmStep, SoftPwm};
 
 // Maximum GPIO pins on the BCM2835. The actual number of pins
 // exposed through the Pi's GPIO header depends on the model.
@@ -133,7 +132,13 @@ macro_rules! impl_output {
         /// [`Pwm`]: ../pwm/struct.Pwm.html
         /// [here]: index.html#software-based-pwm
         pub fn set_pwm_repeating(&mut self, period: Duration, pulse_width: Duration) -> Result<()> {
-            self.set_pwm_sequence(vec![PwmStep::Pulse(PwmPulse { period, pulse_width })], true)
+            self.set_pwm_sequence(
+                vec![PwmStep::Pulse(PwmPulse {
+                    period,
+                    pulse_width,
+                })],
+                true,
+            )
         }
 
         /// Configures an one-off software-based PWM signal.
@@ -153,7 +158,13 @@ macro_rules! impl_output {
         /// [`Pwm`]: ../pwm/struct.Pwm.html
         /// [here]: index.html#software-based-pwm
         pub fn set_pwm_once(&mut self, period: Duration, pulse_width: Duration) -> Result<()> {
-            self.set_pwm_sequence(vec![PwmStep::Pulse(PwmPulse { period, pulse_width })], false)
+            self.set_pwm_sequence(
+                vec![PwmStep::Pulse(PwmPulse {
+                    period,
+                    pulse_width,
+                })],
+                false,
+            )
         }
 
         /// Configures a software-based PWM signal.
@@ -170,7 +181,11 @@ macro_rules! impl_output {
         /// [`PwmStep`]: ./enum.PwmStep.html
         /// [`Pwm`]: ../pwm/struct.Pwm.html
         /// [here]: index.html#software-based-pwm
-        pub fn set_pwm_sequence(&mut self, wave_sequence: Vec<PwmStep>, repeat_indefinitely: bool) -> Result<()> {
+        pub fn set_pwm_sequence(
+            &mut self,
+            wave_sequence: Vec<PwmStep>,
+            repeat_indefinitely: bool,
+        ) -> Result<()> {
             if let Some(ref mut soft_pwm) = self.soft_pwm {
                 soft_pwm.reconfigure(wave_sequence, repeat_indefinitely);
             } else {
@@ -213,7 +228,13 @@ macro_rules! impl_output {
         ///
         /// [`set_pwm`]: #method.set_pwm
         pub fn set_pwm_frequency(&mut self, frequency: f64, duty_cycle: f64) -> Result<()> {
-            self.set_pwm_sequence(vec![PwmStep::Frequency(PwmFrequency { frequency, duty_cycle })], false)
+            self.set_pwm_sequence(
+                vec![PwmStep::Frequency(PwmFrequency {
+                    frequency,
+                    duty_cycle,
+                })],
+                false,
+            )
         }
 
         /// Stops a previously configured software-based PWM signal.
@@ -230,7 +251,10 @@ macro_rules! impl_output {
 
         /// Checks if software-based PWM is still running/has remaining pulses.
         pub fn is_pwm_running(&self) -> bool {
-            self.soft_pwm.as_ref().map(|pwm| pwm.is_running()).unwrap_or(false)
+            self.soft_pwm
+                .as_ref()
+                .map(|pwm| pwm.is_running())
+                .unwrap_or(false)
         }
     };
 }
@@ -585,8 +609,8 @@ impl InputPin {
     /// [`clear_async_interrupt`]: #method.clear_async_interrupt
     /// [`Level`]: enum.Level.html
     pub fn set_async_interrupt<C>(&mut self, trigger: Trigger, callback: C) -> Result<()>
-        where
-            C: FnMut(Level) + Send + 'static,
+    where
+        C: FnMut(Level) + Send + 'static,
     {
         self.clear_interrupt()?;
         self.clear_async_interrupt()?;
