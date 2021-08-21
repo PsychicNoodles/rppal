@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use crate::gpio::{GpioState, interrupt::AsyncInterrupt, Level, Mode, PullUpDown, Result, Trigger};
 
-use super::soft_pwm::{PwmPulse, PwmStep, SoftPwm};
+use super::soft_pwm::{PwmPulse, PwmStep, PwmFrequency, SoftPwm};
 
 
 // Maximum GPIO pins on the BCM2835. The actual number of pins
@@ -107,12 +107,53 @@ macro_rules! impl_output {
             }
         }
 
-        pub fn set_pwm_repeating(&mut self, period: Duration, pulse_width: Duration) -> Result<()> {
-            self.set_pwm(vec![PwmStep::Pulse(PwmPulse { period, pulse_width })], true)
+        /// Configures a repeating software-based PWM signal.
+        ///
+        /// Alias of [`set_pwm_repeating`].
+        ///
+        /// [`set_pwm_repeating`]: #method.set_pwm_repeating
+        pub fn set_pwm(&mut self, period: Duration, pulse_width: Duration) -> Result<()> {
+            self.set_pwm_repeating(period, pulse_width)
         }
 
+        /// Configures a repeating software-based PWM signal.
+        ///
+        /// `period` indicates the time it takes to complete one cycle.
+        ///
+        /// `pulse_width` indicates the amount of time the PWM signal is active during a
+        /// single period.
+        ///
+        /// Software-based PWM is inherently inaccurate on a multi-threaded OS due to
+        /// scheduling/preemption. If an accurate or faster PWM signal is required, use the
+        /// hardware [`Pwm`] peripheral instead. More information can be found [here].
+        ///
+        /// If `set_pwm` is called when a PWM thread is already active, the existing thread
+        /// will be reconfigured at the end of the current cycle.
+        ///
+        /// [`Pwm`]: ../pwm/struct.Pwm.html
+        /// [here]: index.html#software-based-pwm
+        pub fn set_pwm_repeating(&mut self, period: Duration, pulse_width: Duration) -> Result<()> {
+            self.set_pwm_sequence(vec![PwmStep::Pulse(PwmPulse { period, pulse_width })], true)
+        }
+
+        /// Configures an one-off software-based PWM signal.
+        ///
+        /// `period` indicates the time it takes to complete one cycle.
+        ///
+        /// `pulse_width` indicates the amount of time the PWM signal is active during a
+        /// single period.
+        ///
+        /// Software-based PWM is inherently inaccurate on a multi-threaded OS due to
+        /// scheduling/preemption. If an accurate or faster PWM signal is required, use the
+        /// hardware [`Pwm`] peripheral instead. More information can be found [here].
+        ///
+        /// If `set_pwm` is called when a PWM thread is already active, the existing thread
+        /// will be reconfigured at the end of the current cycle.
+        ///
+        /// [`Pwm`]: ../pwm/struct.Pwm.html
+        /// [here]: index.html#software-based-pwm
         pub fn set_pwm_once(&mut self, period: Duration, pulse_width: Duration) -> Result<()> {
-            self.set_pwm(vec![PwmStep::Pulse(PwmPulse { period, pulse_width })], false)
+            self.set_pwm_sequence(vec![PwmStep::Pulse(PwmPulse { period, pulse_width })], false)
         }
 
         /// Configures a software-based PWM signal.
@@ -129,7 +170,7 @@ macro_rules! impl_output {
         /// [`PwmStep`]: ./enum.PwmStep.html
         /// [`Pwm`]: ../pwm/struct.Pwm.html
         /// [here]: index.html#software-based-pwm
-        pub fn set_pwm(&mut self, wave_sequence: Vec<PwmStep>, repeat_indefinitely: bool) -> Result<()> {
+        pub fn set_pwm_sequence(&mut self, wave_sequence: Vec<PwmStep>, repeat_indefinitely: bool) -> Result<()> {
             if let Some(ref mut soft_pwm) = self.soft_pwm {
                 soft_pwm.reconfigure(wave_sequence, repeat_indefinitely);
             } else {
@@ -159,6 +200,20 @@ macro_rules! impl_output {
             }
 
             Ok(())
+        }
+
+        /// Configures a software-based PWM signal.
+        ///
+        /// `set_pwm_frequency` is a convenience method that converts `frequency` to a period and
+        /// `duty_cycle` to a pulse width, and then calls [`set_pwm`].
+        ///
+        /// `frequency` is specified in hertz (Hz).
+        ///
+        /// `duty_cycle` is specified as a floating point value between `0.0` (0%) and `1.0` (100%).
+        ///
+        /// [`set_pwm`]: #method.set_pwm
+        pub fn set_pwm_frequency(&mut self, frequency: f64, duty_cycle: f64) -> Result<()> {
+            self.set_pwm_sequence(vec![PwmStep::Frequency(PwmFrequency { frequency, duty_cycle })], false)
         }
 
         /// Stops a previously configured software-based PWM signal.
