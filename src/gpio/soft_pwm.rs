@@ -111,27 +111,39 @@ impl From<PwmFrequency> for PwmPulse {
 ///
 /// `duty_cycle` is specified as a floating point value between `0.0` (0%) and `1.0` (100%).
 ///
+/// Automatically converted into a [`PwmPulse`] before starting to send the sequence.
+///
+/// `Wait`:
+///
+/// Effectively a pulse with only the `period` (low power) defined.
+///
 /// [`PwmPulse`]: ./struct.PwmPulse.html
 /// [`PwmFrequency`]: ./struct.PwmFrequency.html
 #[derive(Debug, PartialEq, Clone)]
-pub enum PwmWave {
+pub enum PwmStep {
     Pulse(PwmPulse),
     Frequency(PwmFrequency),
     Wait(Duration),
 }
 
+impl From<PwmStep> for PwmPulse {
+    fn from(step: PwmStep) -> Self {
+        match step {
+            PwmStep::Pulse(p) => p,
+            PwmStep::Frequency(f) => PwmPulse::from(f),
+            PwmStep::Wait(w) => PwmPulse { period: w, pulse_width: Duration::ZERO }
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Clone)]
 enum Msg {
-    Reconfigure(Vec<PwmWave>, bool),
+    Reconfigure(Vec<PwmStep>, bool),
     Stop,
 }
 
-fn prepare_iter<T>(period_pulse_widths: T, repeat_indefinitely: bool) -> Box<dyn Iterator<Item=(i64, i64)>> where T: IntoIterator<Item=PwmWave>, <T as IntoIterator>::IntoIter: Clone + 'static {
-    let base_iter = period_pulse_widths.into_iter().map(|wave| From::from(match wave {
-        PwmWave::Pulse(pulse) => pulse,
-        PwmWave::Frequency(freq) => PwmPulse::from(freq),
-        PwmWave::Wait(period) => PwmPulse { period, pulse_width: Duration::ZERO }
-    }));
+fn to_nanos_iter<T>(pwm_steps: T, repeat_indefinitely: bool) -> Box<dyn Iterator<Item=(i64, i64)>> where T: IntoIterator<Item=PwmStep>, <T as IntoIterator>::IntoIter: Clone + 'static {
+    let base_iter = pwm_steps.into_iter().map(PwmPulse::from).map(From::from);
     if repeat_indefinitely {
         Box::new(base_iter.cycle())
     } else {
@@ -141,9 +153,9 @@ fn prepare_iter<T>(period_pulse_widths: T, repeat_indefinitely: bool) -> Box<dyn
 
 fn process_msg(msg: Msg) -> Option<Box<dyn Iterator<Item=(i64, i64)>>> {
     match msg {
-        Msg::Reconfigure(period_pulse_widths, repeat_indefinitely) => {
+        Msg::Reconfigure(pwm_steps, repeat_indefinitely) => {
             // Reconfigure period and pulse width
-            Some(prepare_iter(period_pulse_widths, repeat_indefinitely))
+            Some(to_nanos_iter(pwm_steps, repeat_indefinitely))
         }
         Msg::Stop => {
             // The main thread asked us to stop
@@ -160,9 +172,9 @@ pub(crate) struct SoftPwm {
 }
 
 impl SoftPwm {
-    pub(crate) fn new<T>(pin: u8, gpio_state: Arc<GpioState>, sequence: T, repeat_indefinitely: bool) -> SoftPwm where T: IntoIterator<Item=PwmWave> + Send + Sync + 'static, <T as IntoIterator>::IntoIter: Clone {
+    pub(crate) fn new<T>(pin: u8, gpio_state: Arc<GpioState>, pwm_steps: T, repeat_indefinitely: bool) -> SoftPwm where T: IntoIterator<Item=PwmStep> + Send + Sync + 'static, <T as IntoIterator>::IntoIter: Clone {
         let running = Arc::new(AtomicBool::new(false));
-        let (sender, pwm_thread) = SoftPwm::start(pin, gpio_state, sequence, repeat_indefinitely, running.clone());
+        let (sender, pwm_thread) = SoftPwm::start(pin, gpio_state, pwm_steps, repeat_indefinitely, running.clone());
 
         SoftPwm {
             pwm_thread: Some(pwm_thread),
@@ -171,7 +183,7 @@ impl SoftPwm {
         }
     }
 
-    fn start<T>(pin: u8, gpio_state: Arc<GpioState>, period_pulse_widths: T, repeat_indefinitely: bool, running: Arc<AtomicBool>) -> (Sender<Msg>, JoinHandle<Result<()>>) where T: IntoIterator<Item=PwmWave> + Send + Sync + 'static, <T as IntoIterator>::IntoIter: Clone {
+    fn start<T>(pin: u8, gpio_state: Arc<GpioState>, pwm_steps: T, repeat_indefinitely: bool, running: Arc<AtomicBool>) -> (Sender<Msg>, JoinHandle<Result<()>>) where T: IntoIterator<Item=PwmStep> + Send + Sync + 'static, <T as IntoIterator>::IntoIter: Clone {
         let (sender, receiver): (Sender<Msg>, Receiver<Msg>) = mpsc::channel();
 
         let pwm_thread = thread::spawn(move || -> Result<()> {
@@ -207,16 +219,16 @@ impl SoftPwm {
                 libc::prctl(PR_SET_TIMERSLACK, 1);
             }
 
-            let mut ppw_iter = prepare_iter(period_pulse_widths, repeat_indefinitely);
-            let mut ppw_next = ppw_iter.next();
-            if ppw_next.is_some() {
+            let mut pwm_nano_iter = to_nanos_iter(pwm_steps, repeat_indefinitely);
+            let mut pwm_next_nano = pwm_nano_iter.next();
+            if pwm_next_nano.is_some() {
                 running.store(true, Ordering::Release);
             }
 
             let mut start_ns = get_time_ns();
 
             loop {
-                match ppw_next {
+                match pwm_next_nano {
                     Some((period_ns, pulse_width_ns)) => {
                         // PWM active
                         if pulse_width_ns > 0 {
@@ -241,15 +253,19 @@ impl SoftPwm {
                         gpio_state.gpio_mem.set_low(pin);
 
                         // Get next PWM duration and prepare next period duration
-                        while let Ok(msg) = receiver.try_recv() {
-                            match process_msg(msg) {
-                                Some(_ppw_iter) => ppw_iter = _ppw_iter,
-                                None => return Ok(())
+                        loop {
+                            match receiver.try_recv().map(process_msg) {
+                                // Received a Reconfigure
+                                Ok(Some(_pwm_nano_iter)) => { pwm_nano_iter = _pwm_nano_iter }
+                                // Received a Stop
+                                Ok(None) => { return Ok(()); }
+                                // Receiver was closed
+                                Err(_) => { break; }
                             }
                         }
 
-                        // Buffer next pair
-                        ppw_next = ppw_iter.next();
+                        // Buffer next period and pulse width pair
+                        pwm_next_nano = pwm_nano_iter.next();
 
                         let remaining_ns = period_ns - (get_time_ns() - start_ns);
 
@@ -271,18 +287,27 @@ impl SoftPwm {
                     }
                     None => {
                         running.store(false, Ordering::Release);
+
+                        // Wait for a sequence
                         match receiver.recv().map(process_msg) {
-                            Ok(Some(_ppw_iter)) => ppw_iter = _ppw_iter,
-                            // Received a Stop msg or recv returned an error
+                            // Received a Reconfigure
+                            Ok(Some(_ppw_iter)) => pwm_nano_iter = _ppw_iter,
+                            // Received a Stop msg or receiver was closed
                             Ok(None) | Err(_) => return Ok(()),
                         }
+
                         // Get through any other messages that may have been queued up
-                        while let Ok(msg) = receiver.try_recv() {
-                            match process_msg(msg) {
-                                Some(_ppw_iter) => ppw_iter = _ppw_iter,
-                                None => return Ok(())
+                        loop {
+                            match receiver.try_recv().map(process_msg) {
+                                // Received a Reconfigure
+                                Ok(Some(_pwm_nano_iter)) => { pwm_nano_iter = _pwm_nano_iter }
+                                // Received a Stop
+                                Ok(None) => { return Ok(()); }
+                                // Receiver was closed
+                                Err(_) => { break; }
                             }
                         }
+
                         running.store(true, Ordering::Release);
                     }
                 }
@@ -291,8 +316,8 @@ impl SoftPwm {
         (sender, pwm_thread)
     }
 
-    pub(crate) fn reconfigure<T: IntoIterator<Item=PwmWave>>(&mut self, period_pulse_widths: T, repeat_indefinitely: bool) {
-        let _ = self.sender.send(Msg::Reconfigure(period_pulse_widths.into_iter().collect(), repeat_indefinitely));
+    pub(crate) fn reconfigure<T: IntoIterator<Item=PwmStep>>(&mut self, pwm_steps: T, repeat_indefinitely: bool) {
+        let _ = self.sender.send(Msg::Reconfigure(pwm_steps.into_iter().collect(), repeat_indefinitely));
     }
 
     pub(crate) fn stop(&mut self) -> Result<()> {

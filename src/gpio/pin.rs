@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use crate::gpio::{GpioState, interrupt::AsyncInterrupt, Level, Mode, PullUpDown, Result, Trigger};
 
-use super::soft_pwm::{PwmPulse, PwmWave, SoftPwm};
+use super::soft_pwm::{PwmPulse, PwmStep, SoftPwm};
 
 
 // Maximum GPIO pins on the BCM2835. The actual number of pins
@@ -108,16 +108,16 @@ macro_rules! impl_output {
         }
 
         pub fn set_pwm_repeating(&mut self, period: Duration, pulse_width: Duration) -> Result<()> {
-            self.set_pwm(vec![PwmWave::Pulse(PwmPulse { period, pulse_width })], true)
+            self.set_pwm(vec![PwmStep::Pulse(PwmPulse { period, pulse_width })], true)
         }
 
         pub fn set_pwm_once(&mut self, period: Duration, pulse_width: Duration) -> Result<()> {
-            self.set_pwm(vec![PwmWave::Pulse(PwmPulse { period, pulse_width })], false)
+            self.set_pwm(vec![PwmStep::Pulse(PwmPulse { period, pulse_width })], false)
         }
 
         /// Configures a software-based PWM signal.
         ///
-        /// See [`PwmWave`] for details on `wave_sequence`.
+        /// See [`PwmStep`] for details on `wave_sequence`.
         ///
         /// Software-based PWM is inherently inaccurate on a multi-threaded OS due to
         /// scheduling/preemption. If an accurate or faster PWM signal is required, use the
@@ -126,10 +126,10 @@ macro_rules! impl_output {
         /// If `set_pwm` is called when a PWM thread is already active, the existing thread
         /// will be reconfigured at the end of the current cycle.
         ///
-        /// [`PwmWave`]: ./enum.PwmWave.html
+        /// [`PwmStep`]: ./enum.PwmStep.html
         /// [`Pwm`]: ../pwm/struct.Pwm.html
         /// [here]: index.html#software-based-pwm
-        pub fn set_pwm(&mut self, wave_sequence: Vec<PwmWave>, repeat_indefinitely: bool) -> Result<()> {
+        pub fn set_pwm(&mut self, wave_sequence: Vec<PwmStep>, repeat_indefinitely: bool) -> Result<()> {
             if let Some(ref mut soft_pwm) = self.soft_pwm {
                 soft_pwm.reconfigure(wave_sequence, repeat_indefinitely);
             } else {
